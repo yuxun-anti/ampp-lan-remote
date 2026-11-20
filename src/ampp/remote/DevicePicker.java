@@ -53,8 +53,9 @@ final class DevicePicker implements AutoCloseable {
         String[] names = labels.clone();
         final int checked = current;
         boolean[] available = new boolean[labels.length];
+        boolean[] canJoin = new boolean[labels.length];
         for (int i = 0; i < labels.length; i++) {
-            labels[i] += i == current ? " · 当前播放设备" : " · 检测中…";
+            labels[i] += i == current ? (source == null ? " · 本机模式" : " · 当前播放设备") : " · 检测中…";
         }
         AlertDialog.Builder builder = Dialogs.builder(context);
         ArrayAdapter<String> rows = new ArrayAdapter<String>(builder.getContext(),
@@ -62,15 +63,25 @@ final class DevicePicker implements AutoCloseable {
             @Override public boolean areAllItemsEnabled() { return false; }
             @Override public boolean isEnabled(int position) { return available[position]; }
         };
-        AlertDialog dialog = Dialogs.show(builder
+        builder
                 .setTitle(owner == null ? "播放设备" : "播放设备 · 在 " + owner + " 上播放")
                 .setSingleChoiceItems(rows, current, (sheet, index) -> {
                     if (index != checked && !selecting && !closed && available[index]) {
                         sheet.dismiss();
-                        switchTo(context, index == 0 ? null : paired.get(index - 1));
+                        RemoteStore.Device device = index == 0 ? null : paired.get(index - 1);
+                        if (canJoin[index]) {
+                            Context app = context.getApplicationContext();
+                            probe.attach(device, message -> toast(app, message));
+                        } else {
+                            switchTo(context, device);
+                        }
                     }
                 })
-                .setNegativeButton("取消", null));
+                .setNegativeButton("取消", null);
+        if (source != null) {
+            builder.setNeutralButton("退出遥控", (sheet, unused) -> returnToLocal(context));
+        }
+        AlertDialog dialog = Dialogs.show(builder);
         worker.execute(() -> {
             for (int i = 0; i < names.length && !Thread.currentThread().isInterrupted(); i++) {
                 if (i == checked) continue;
@@ -81,6 +92,7 @@ final class DevicePicker implements AutoCloseable {
                     if (!dialog.isShowing()) return;
                     labels[index] = names[index] + " · " + status.label;
                     available[index] = status.enabled;
+                    canJoin[index] = status == Choice.JOIN;
                     rows.notifyDataSetChanged();
                 });
             }
@@ -88,7 +100,9 @@ final class DevicePicker implements AutoCloseable {
     }
 
     private enum Choice {
-        READY(true, "可接管"), LEGACY(true, "可尝试接管"), OFFLINE(false, "离线或未开启接收"),
+        READY(true, "可接管"), LEGACY(true, "可尝试接管"), LOCAL(true, "退出遥控"),
+        JOIN(true, "正在播放 · 可接入遥控"),
+        OFFLINE(false, "离线或未开启接收"),
         UNPAIRED(false, "当前播放设备未配对它"), BUSY(false, "正在播放或交接"),
         EMPTY(false, "没有可交接的曲目"), UNKNOWN(false, "暂无法确认");
         final boolean enabled;
@@ -100,14 +114,15 @@ final class DevicePicker implements AutoCloseable {
     }
 
     private Choice checkChoice(RemoteStore.Device source, RemoteStore.Device target) {
-        if (target == null && !receiving.getAsBoolean()) return Choice.OFFLINE;
+        if (target == null && !receiving.getAsBoolean()) return Choice.LOCAL;
         JSONObject targetRole = target == null ? null : target.peer.role();
         if (target != null && targetRole == null) return Choice.OFFLINE;
-        if (targetRole != null && (targetRole.optBoolean("busy") || targetRole.optBoolean("playing"))) return Choice.BUSY;
+        if (targetRole != null && targetRole.optBoolean("busy")) return Choice.BUSY;
+        if (targetRole != null && targetRole.optBoolean("playing")) return source == null ? Choice.JOIN : Choice.BUSY;
         String targetId = target == null ? node : targetRole.optString("node");
         if (source != null) {
             JSONObject sourceRole = source.peer.role();
-            if (sourceRole == null) return Choice.UNKNOWN;
+            if (sourceRole == null) return target == null ? Choice.LOCAL : Choice.UNKNOWN;
             if (!sourceRole.has("staging")) return Choice.LEGACY;
         }
         String route = "check/" + targetId;
@@ -124,9 +139,10 @@ final class DevicePicker implements AutoCloseable {
     private void switchTo(Context context, RemoteStore.Device destination) {
         RemoteStore.Device source = probe.remoteDevice();
         if (source != null && destination == null && !receiving.getAsBoolean()) {
-            toast(context, "请先在插件设置里开启本机接收，并在当前播放设备上配对本机。");
+            returnToLocal(context);
             return;
         }
+        if (source == null && destination == null) return;
         selecting = true;
         Context app = context.getApplicationContext();
         toast(app, "正在交接播放…");
@@ -136,16 +152,33 @@ final class DevicePicker implements AutoCloseable {
                 JSONObject role = destination == null ? null : destination.peer.role();
                 if (destination == null || role != null) {
                     String target = destination == null ? node : role.optString("node");
-                    status = source == null ? roles.move(target) : source.peer.changeRole("move/" + target, 46000);
+                    if (source == null) {
+                        status = roles.move(target);
+                    } else if (destination == null && source.peer.role() == null) {
+                        status = 0;
+                    } else {
+                        status = source.peer.changeRole("move/" + target, 46000);
+                    }
                 }
             } finally {
                 int result = status;
                 main.post(() -> {
                     selecting = false;
-                    if (!closed) toast(app, message(result, destination));
+                    if (closed) return;
+                    if (source != null && destination == null && result == 0) {
+                        if (probe.remoteDevice() == source) returnToLocal(app);
+                        else if (probe.remoteDevice() == null) toast(app, "已返回本机播放。");
+                    } else {
+                        toast(app, message(result, destination));
+                    }
                 });
             }
         });
+    }
+
+    private void returnToLocal(Context context) {
+        Context app = context.getApplicationContext();
+        probe.detach(message -> toast(app, message));
     }
 
     private static String message(int status, RemoteStore.Device destination) {

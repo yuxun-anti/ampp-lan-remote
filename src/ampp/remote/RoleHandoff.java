@@ -78,7 +78,7 @@ final class RoleHandoff implements LanServer.Roles {
         if (next == null) return null;
         JSONObject state = PairedPlayback.readRaw(next);
         try {
-            if (state == null) state = new JSONObject().put("ready", false);
+            if (state == null) state = new JSONObject().put("ready", false).put("outputUnavailable", true);
             String destination = state.optString("following", following);
             if (destination.isEmpty()) destination = following;
             state.put("following", destination);

@@ -18,6 +18,7 @@ final class CatalogPlayback {
     private final Method getItem;
     private final Method mediaType;
     private final Method mediaStoreId;
+    private final Method mediaAlbumId;
     private final Class<?> playbackItem;
     private final Method contentType;
     private final Method playbackStoreId;
@@ -41,6 +42,7 @@ final class CatalogPlayback {
         getItem = provider.getMethod("getItemAtIndex", int.class);
         mediaType = media.getMethod("getType");
         mediaStoreId = media.getMethod("getSubscriptionStoreId");
+        mediaAlbumId = media.getMethod("getAlbumSubscriptionStoreId");
         playbackItem = loader.loadClass(ROOT + "model.PlaybackItem");
         collectionItem = loader.loadClass(ROOT + "model.CollectionItemView");
         contentType = collectionItem.getMethod("getContentType");
@@ -98,8 +100,14 @@ final class CatalogPlayback {
     }
 
     String albumFromProvider(Object provider) throws ReflectiveOperationException {
-        return Integer.valueOf(1).equals(containerType.invoke(provider))
-                ? checked(containerStoreId.invoke(provider)) : null;
+        if (Integer.valueOf(1).equals(containerType.invoke(provider))) {
+            String album = checked(containerStoreId.invoke(provider));
+            if (album != null) return album;
+        }
+        int index = selectedIndex(provider);
+        if (index >= (Integer) itemCount.invoke(provider)) return null;
+        Object item = getItem.invoke(provider, index);
+        return item == null ? null : checked(mediaAlbumId.invoke(item));
     }
 
     int selectedIndex(Object provider) throws ReflectiveOperationException {

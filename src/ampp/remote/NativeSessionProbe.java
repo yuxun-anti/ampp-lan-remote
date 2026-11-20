@@ -22,6 +22,7 @@ import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.util.Collections;
+import java.util.EnumMap;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.Executors;
@@ -48,6 +49,10 @@ final class NativeSessionProbe implements AutoCloseable, RoleHandoff.Playback {
     private final Constructor<?> positionInfo;
     private final Method stateUpdated;
     private final Method queueChanged;
+    private final NativeNextButton nextButton;
+    private final Method modesChanged;
+    private final Constructor<?> modeChanges;
+    private final EnumMap<PlaybackMode, NativeMode> playbackModes = new EnumMap<>(PlaybackMode.class);
     private final Method nativeMediaItem;
     private final NativeTrack nativeTrack;
     private final CatalogPlayback catalogPlayback;
@@ -68,9 +73,13 @@ final class NativeSessionProbe implements AutoCloseable, RoleHandoff.Playback {
     private final Method nativeSeek;
     private final Method localPlay;
     private final Method localPause;
+    private final Method restoreState;
+    private final Method addControllerListener;
+    private final Method removeControllerListener;
     private final Method allQueueItems;
     private final Method skipToQueueItem;
     private final Method engineDuration;
+    private final Method containerStoreId;
     private final Field serviceHandler;
     private final Field currentField;
     private final Field switchScope;
@@ -123,6 +132,15 @@ final class NativeSessionProbe implements AutoCloseable, RoleHandoff.Playback {
         }
         foreground = foregroundService;
         Class<?> listener = type(ROOT + "playback.controller.MediaPlayerController$Listener");
+        Class<?> modeContainer = type(ROOT + "playback.queue.PlaybackModeContainer");
+        modeChanges = modeContainer.getConstructor();
+        modesChanged = listener.getMethod("onPlaybackModeChanged", controller, modeContainer);
+        for (PlaybackMode mode : PlaybackMode.values()) {
+            playbackModes.put(mode, new NativeMode(controller.getMethod(mode.getter),
+                    controller.getMethod(mode.capability), controller.getMethod(mode.setter,
+                            mode == PlaybackMode.AUTOPLAY ? boolean.class : int.class),
+                    modeContainer.getMethod(mode.changeSetter, Integer.class)));
+        }
         Class<?> queue = type(ROOT + "playback.model.PlayerQueueItem");
         Class<?> media = type(ROOT + "playback.model.PlayerMediaItem");
         Class<?> playbackManager = type(ROOT + "player.N");
@@ -152,6 +170,9 @@ final class NativeSessionProbe implements AutoCloseable, RoleHandoff.Playback {
         currentState = controller.getMethod("getPlaybackState");
         localPlay = controller.getMethod("play");
         localPause = controller.getMethod("pause");
+        restoreState = controller.getMethod("restoreState", boolean.class, boolean.class);
+        addControllerListener = controller.getMethod("addListener", listener);
+        removeControllerListener = controller.getMethod("removeListener", listener);
         allQueueItems = controller.getMethod("getAllQueueItems");
         skipToQueueItem = controller.getMethod("skipToQueueItemWithId", long.class);
         mediaOf = queue.getMethod("getItem");
@@ -162,6 +183,7 @@ final class NativeSessionProbe implements AutoCloseable, RoleHandoff.Playback {
         canNext = controller.getMethod("canSkipToNextItem");
         canPrevious = controller.getMethod("canSkipToPreviousItem");
         engineDuration = controller.getMethod("getDuration");
+        containerStoreId = controller.getMethod("getCurrentContainerStoreId");
         nativePrevious = playbackManager.getMethod("w");
         nativeNext = playbackManager.getMethod("y");
         nativeSeek = playbackManager.getMethod("seekTo", long.class);
@@ -200,6 +222,9 @@ final class NativeSessionProbe implements AutoCloseable, RoleHandoff.Playback {
                     if (attached.poll != null) attached.poll.cancel(false);
                     isolation.end(attached.lease, false);
                     bridge = null;
+                    if (attached.exitRequested || attached.detaching) {
+                        main.post(NativeSessionProbe.this::finishAttempt);
+                    }
                 }
                 if (!connecting) unbindService();
             }
@@ -209,6 +234,17 @@ final class NativeSessionProbe implements AutoCloseable, RoleHandoff.Playback {
         } catch (ReflectiveOperationException | RuntimeException unavailable) {
             context.log("Album row selection hooks unavailable", unavailable);
         }
+        NativeNextButton navigation = null;
+        try {
+            navigation = new NativeNextButton(context, () -> {
+                Bridge active = bridge;
+                return active == null || !active.armed ? null
+                        : (active.snapshot.actions() & PlaybackState.ACTION_SKIP_TO_NEXT) != 0;
+            });
+        } catch (ReflectiveOperationException | RuntimeException unavailable) {
+            context.log("Native next button hook unavailable", unavailable);
+        }
+        nextButton = navigation;
     }
 
     private boolean armedBridge() {
@@ -404,10 +440,11 @@ final class NativeSessionProbe implements AutoCloseable, RoleHandoff.Playback {
         if (Boolean.TRUE.equals(canSeek.invoke(engine))) actions |= PlaybackState.ACTION_SEEK_TO;
         if (Boolean.TRUE.equals(canNext.invoke(engine))) actions |= PlaybackState.ACTION_SKIP_TO_NEXT;
         if (Boolean.TRUE.equals(canPrevious.invoke(engine))) actions |= PlaybackState.ACTION_SKIP_TO_PREVIOUS;
-        return new JSONObject()
+        JSONObject result = new JSONObject()
                 .put("ready", true)
                 .put("mediaId", storeId.invoke(media))
                 .put("queueEntry", String.valueOf(queueId.invoke(queue)))
+                .put("containerId", containerStoreId.invoke(engine))
                 .put("title", title.invoke(media))
                 .put("artist", artist.invoke(media))
                 .put("album", album.invoke(media))
@@ -418,9 +455,42 @@ final class NativeSessionProbe implements AutoCloseable, RoleHandoff.Playback {
                 .put("speed", getRate.invoke(engine))
                 .put("playing", state == 1)
                 .put("actions", actions);
+        for (PlaybackMode mode : PlaybackMode.values()) {
+            NativeMode nativeMode = playbackModes.get(mode);
+            result.put(mode.route, nativeMode.read.invoke(engine));
+            result.put(mode.route + "Available", nativeMode.supported.invoke(engine));
+        }
+        return result;
+    }
+
+    private static final class NativeMode {
+        final Method read;
+        final Method supported;
+        final Method write;
+        final Method event;
+
+        NativeMode(Method read, Method supported, Method write, Method event) {
+            this.read = read;
+            this.supported = supported;
+            this.write = write;
+            this.event = event;
+        }
     }
 
     Integer transportLocal(String command, long position) {
+        PlaybackMode mode = PlaybackMode.forRoute(command);
+        if (mode != null) {
+            if (!mode.accepts(position)) return 400;
+            Integer status = callLocal((service, engine) -> {
+                NativeMode nativeMode = playbackModes.get(mode);
+                if (!Boolean.TRUE.equals(nativeMode.supported.invoke(engine))) return 409;
+                Object value = mode == PlaybackMode.AUTOPLAY ? Boolean.valueOf(position == 2)
+                        : Integer.valueOf((int) position);
+                nativeMode.write.invoke(engine, value);
+                return 204;
+            });
+            return status == null ? 409 : status;
+        }
         if (!"previous".equals(command) && !"next".equals(command) && !"seek".equals(command)) return null;
         return callLocal((service, engine) -> {
             Object player = mediaManager.get(service);
@@ -446,20 +516,7 @@ final class NativeSessionProbe implements AutoCloseable, RoleHandoff.Playback {
         if (!CatalogPlayback.validId(id)) return 400;
         Integer status = callLocal((service, engine) -> {
             List<?> existing = (List<?>) allQueueItems.invoke(engine);
-            if (existing.size() > 1) {
-                Object current = currentItem.invoke(engine);
-                if (current != null && queueSong(current, id)) {
-                    if (Boolean.TRUE.equals(canSeek.invoke(engine))) nativeSeek.invoke(mediaManager.get(service), 0L);
-                    localPlay.invoke(engine);
-                    return 204;
-                }
-                for (Object row : existing) {
-                    if (!queueSong(row, id)) continue;
-                    skipToQueueItem.invoke(engine, queueId.invoke(row));
-                    localPlay.invoke(engine);
-                    return 204;
-                }
-            }
+            if (existing.size() > 1 && playQueuedSong(service, engine, id)) return 204;
             catalogPlayback.play(engine, id);
             return 204;
         });
@@ -473,20 +530,35 @@ final class NativeSessionProbe implements AutoCloseable, RoleHandoff.Playback {
 
     int playLocalAlbumSong(String song, String album, int index) {
         Integer prepared = callLocal((service, engine) -> {
+            if (album.equals(containerStoreId.invoke(engine)) && playQueuedSong(service, engine, song)) return 200;
             catalogPlayback.prepare(engine, album, index, false);
             return 204;
         });
+        if (Integer.valueOf(200).equals(prepared)) return 204;
         if (!Integer.valueOf(204).equals(prepared)) return prepared == null ? 409 : prepared;
-        if (awaitState(state -> song.equals(state.optString("mediaId")) && !state.optBoolean("playing"), 4300) == null) {
+        if (awaitState(state -> !state.optBoolean("playing") && (song.equals(state.optString("mediaId"))
+                || album.equals(state.optString("containerId"))), 4300) == null) {
             return 422;
         }
-        Integer playing = callLocal((service, engine) -> {
-            Object row = currentItem.invoke(engine);
-            if (!queueSong(row, song)) return 422;
-            localPlay.invoke(engine);
-            return 204;
-        });
+        Integer playing = callLocal((service, engine) -> playQueuedSong(service, engine, song) ? 204 : 422);
         return playing == null ? 409 : playing;
+    }
+
+    private boolean playQueuedSong(Object service, Object engine, String song) throws ReflectiveOperationException {
+        if (queueSong(currentItem.invoke(engine), song)) {
+            if (Boolean.TRUE.equals(canSeek.invoke(engine))) {
+                nativeSeek.invoke(mediaManager.get(service), 0L);
+            }
+            localPlay.invoke(engine);
+            return true;
+        }
+        for (Object item : (List<?>) allQueueItems.invoke(engine)) {
+            if (!queueSong(item, song)) continue;
+            // The native controller starts playback when selecting an existing queue item.
+            skipToQueueItem.invoke(engine, queueId.invoke(item));
+            return true;
+        }
+        return false;
     }
 
     private interface LocalCall {
@@ -743,12 +815,25 @@ final class NativeSessionProbe implements AutoCloseable, RoleHandoff.Playback {
             report.accept("当前未接入原生会话。");
             return;
         }
-        if (!entry.handler.post(() -> detachService(entry, report))) {
-            report.accept("播放服务已退出。重新打开 Apple Music 即可。");
-        }
+        connecting = true;
+        entry.exitRequested = true;
+        worker.execute(() -> {
+            boolean stopped = PairedPlayback.pauseAndConfirm(entry.target.peer);
+            Consumer<String> completion = message -> report.accept(!stopped && bridge == null
+                    ? "已恢复本机。未能确认原播放设备已暂停，若它仍在播放，请先在那台设备暂停。"
+                    : message);
+            if (!entry.handler.post(() -> detachService(entry, completion))) {
+                result(report, "播放服务已退出。重新打开 Apple Music 即可。");
+            }
+        });
     }
 
     private void detachService(Bridge entry, Consumer<String> report) {
+        if (bridge != entry || entry.detaching) {
+            main.post(() -> report.accept(bridge == null ? "已返回本机播放。" : "正在返回本机播放…"));
+            return;
+        }
+        entry.detaching = true;
         try {
             entry.armed = false;
             entry.closeCard();
@@ -756,19 +841,18 @@ final class NativeSessionProbe implements AutoCloseable, RoleHandoff.Playback {
             Object current = currentField.get(entry.manager);
             if (current == entry.adapter) {
                 Object replacement = newLocal.invoke(null, entry.handler);
-                controller.getMethod("addListener", stateChanged.getDeclaringClass())
-                        .invoke(replacement, field(entry.manager.getClass(), "k",
+                addControllerListener.invoke(replacement, field(entry.manager.getClass(), "k",
                                 type(ROOT + "playback.RecentlyPlayedMediaProvider")).get(entry.manager));
                 launch(entry.service, entry.manager, replacement);
                 entry.handler.postDelayed(() -> confirmDetached(entry, replacement, report, 30), 150);
-            } else if (current != entry.lease.oldPlayer || entry.wasAttached) {
-                restoreLocal(entry, report);
+            } else if (local.isInstance(current) && (current != entry.lease.oldPlayer || entry.wasAttached)) {
+                restoreLocalState(entry, current, report);
             } else {
-                result(report, "播放服务尚未完成切换。请强制停止并重新打开 Apple Music。");
+                detachFailed(entry, report, "播放服务尚未完成切换。请重启 Apple Music。");
             }
         } catch (ReflectiveOperationException | RuntimeException failure) {
             context.log("Native controller detach failed", unwrap(failure));
-            result(report, "请强制停止并重新打开 Apple Music 以退出测试。");
+            detachFailed(entry, report, "本机播放器恢复失败。请重启 Apple Music。");
         }
     }
 
@@ -776,22 +860,93 @@ final class NativeSessionProbe implements AutoCloseable, RoleHandoff.Playback {
         try {
             if (bridge != entry) return;
             if (currentField.get(entry.manager) == replacement) {
-                restoreLocal(entry, report);
+                restoreLocalState(entry, replacement, report);
             } else if (attempts > 0 && serviceInstance.get() == entry.service) {
                 entry.handler.postDelayed(() -> confirmDetached(entry, replacement, report, attempts - 1), 150);
             } else {
-                result(report, "尚未恢复本机控制器。请重启 Apple Music。");
+                detachFailed(entry, report, "尚未恢复本机控制器。请重启 Apple Music。");
             }
         } catch (ReflectiveOperationException | RuntimeException failure) {
             context.log("Native controller restore confirmation failed", unwrap(failure));
-            result(report, "尚未恢复本机控制器。请重启 Apple Music。");
+            detachFailed(entry, report, "尚未恢复本机控制器。请重启 Apple Music。");
         }
+    }
+
+    private void restoreLocalState(Bridge entry, Object engine, Consumer<String> report)
+            throws ReflectiveOperationException {
+        Class<?> listener = stateChanged.getDeclaringClass();
+        // The controller reports readiness on the service handler after loading its saved queue.
+        class RestoreListener implements InvocationHandler {
+            Runnable timeout;
+
+            @Override public Object invoke(Object proxy, Method method, Object[] args) {
+                switch (method.getName()) {
+                    case "equals": return proxy == args[0];
+                    case "hashCode": return System.identityHashCode(proxy);
+                    case "toString": return "AM++ local restore listener";
+                    case "onPlayerStateRestored":
+                        if (args[0] == engine) {
+                            entry.handler.removeCallbacks(timeout);
+                            try {
+                                removeControllerListener.invoke(engine, proxy);
+                                if (bridge == entry && serviceInstance.get() == entry.service
+                                        && currentField.get(entry.manager) == engine) {
+                                    Bundle extras = new Bundle();
+                                    extras.putBoolean(REMOTE, false);
+                                    setExtras.invoke(entry.manager, extras);
+                                    restoreLocal(entry, report);
+                                } else if (bridge == entry) {
+                                    detachFailed(entry, report, "本机播放器已切换，请重新打开播放页。");
+                                }
+                            } catch (ReflectiveOperationException | RuntimeException failure) {
+                                context.log("Local playback state could not be restored", unwrap(failure));
+                                detachFailed(entry, report, "本机播放器恢复失败。请重启 Apple Music。");
+                            }
+                        }
+                        return null;
+                    default: return null;
+                }
+            }
+        }
+        RestoreListener completion = new RestoreListener();
+        Object proxy = Proxy.newProxyInstance(listener.getClassLoader(), new Class<?>[]{listener}, completion);
+        completion.timeout = () -> {
+            try {
+                removeControllerListener.invoke(engine, proxy);
+            } catch (ReflectiveOperationException failure) {
+                context.log("Local restore listener cleanup failed", unwrap(failure));
+            }
+            if (bridge == entry) detachFailed(entry, report, "本机队列恢复超时。请重试退出遥控。");
+        };
+        addControllerListener.invoke(engine, proxy);
+        entry.handler.postDelayed(completion.timeout, 2500);
+        try {
+            restoreState.invoke(engine, false, false);
+        } catch (ReflectiveOperationException | RuntimeException failure) {
+            entry.handler.removeCallbacks(completion.timeout);
+            removeControllerListener.invoke(engine, proxy);
+            throw failure;
+        }
+    }
+
+    private void detachFailed(Bridge entry, Consumer<String> report, String message) {
+        entry.detaching = false;
+        entry.exitRequested = false;
+        result(report, message);
     }
 
     private void restoreLocal(Bridge entry, Consumer<String> report) {
         isolation.end(entry.lease, true);
         bridge = null;
-        result(report, "已返回本机播放。可重新开启自动接入，或手动接入设备。");
+        if (nextButton != null) nextButton.refresh();
+        result(report, "已恢复本机播放器。");
+    }
+
+    private void recoverOffline(Bridge entry) {
+        if (closed || bridge != entry || !entry.armed || entry.exitRequested || takingPlayback) return;
+        RoleHandoff handoff = roles;
+        if (handoff != null) handoff.localSelected();
+        detachService(entry, message -> {});
     }
 
     private void result(Consumer<String> report, String message) {
@@ -848,6 +1003,7 @@ final class NativeSessionProbe implements AutoCloseable, RoleHandoff.Playback {
         private JSONObject lastTrack;
         private long lastRefresh;
         private long nextRoleLookup;
+        private final RemoteReachability reachability = new RemoteReachability();
         private long artworkEpoch;
         private String artworkKey = "";
         private String shownArtwork;
@@ -855,6 +1011,8 @@ final class NativeSessionProbe implements AutoCloseable, RoleHandoff.Playback {
         private long nextArtworkTry;
         private int artworkAttempts;
         volatile boolean armed;
+        volatile boolean exitRequested;
+        boolean detaching;
         boolean wasAttached;
         volatile java.util.concurrent.ScheduledFuture<?> poll;
         Object adapter;
@@ -910,20 +1068,27 @@ final class NativeSessionProbe implements AutoCloseable, RoleHandoff.Playback {
         }
 
         void poll() {
-            if (closed || !armed || serviceInstance.get() != service) return;
+            if (closed || !armed || exitRequested || serviceInstance.get() != service) return;
             JSONObject state = PairedPlayback.readRaw(target);
+            boolean reachable = PairedPlayback.outputReachable(state);
+            long now = SystemClock.elapsedRealtime();
+            if (reachability.shouldRecover(reachable, now)) {
+                handler.post(() -> recoverOffline(this));
+                return;
+            }
             RoleHandoff currentRoles = roles;
-            if (currentRoles != null && state != null) {
+            if (currentRoles != null && reachable) {
                 String destination = state.optString("following");
-                long now = SystemClock.elapsedRealtime();
                 if (!destination.isEmpty() && !destination.equals(localNode) && now >= nextRoleLookup) {
                     nextRoleLookup = now + 3000;
                     RemoteStore.Device nextDevice = currentRoles.device(destination);
-                    if (nextDevice != null) follow(nextDevice);
+                    if (nextDevice != null) main.post(() -> {
+                        if (bridge == this && armed && !exitRequested && !connecting) follow(nextDevice, 0);
+                    });
                 }
             }
             JSONObject data = state != null && state.optBoolean("ready") ? state : null;
-            TrackSnapshot next = new TrackSnapshot(data, SystemClock.elapsedRealtime());
+            TrackSnapshot next = new TrackSnapshot(data, now);
             handler.post(() -> accept(next));
         }
 
@@ -1035,6 +1200,11 @@ final class NativeSessionProbe implements AutoCloseable, RoleHandoff.Playback {
             boolean refresh = initial || trackChanged || jumped || next.sampledAt - lastRefresh >= 1800L;
             if (refresh || playbackChanged) lastRefresh = next.sampledAt;
             oldState = state;
+            if (nextButton != null && (initial || old != null
+                    && ((old.actions() ^ next.actions()) & PlaybackState.ACTION_SKIP_TO_NEXT) != 0)) {
+                nextButton.refresh();
+            }
+            publishModes(initial, old, next);
             for (Object listener : listeners) {
                 try {
                     if (initial || trackChanged) {
@@ -1042,12 +1212,39 @@ final class NativeSessionProbe implements AutoCloseable, RoleHandoff.Playback {
                         queueChanged.invoke(listener, adapter, Collections.emptyList());
                     }
                     if (initial || playbackChanged) stateChanged.invoke(listener, adapter, previousState, state);
-                    else if (refresh) stateUpdated.invoke(listener, adapter);
+                    else if (refresh || old != null && old.actions() != next.actions()) {
+                        stateUpdated.invoke(listener, adapter);
+                    }
                 } catch (ReflectiveOperationException | RuntimeException error) {
                     context.log("Native playback callback rejected", unwrap(error));
                 }
             }
             if (jumped || trackChanged) notifyPosition(previousQueue, old, next, trackChanged);
+        }
+
+        private void publishModes(boolean initial, TrackSnapshot old, TrackSnapshot next) {
+            JSONObject previous = old == null ? null : old.data;
+            boolean changed = initial || old != null && old.actions() != next.actions();
+            PlaybackMode[] modes = PlaybackMode.values();
+            int updated = 0;
+            for (PlaybackMode mode : modes) {
+                if (initial || mode.value(previous) != mode.value(next.data)
+                        || mode.available(previous) != mode.available(next.data)) {
+                    updated |= 1 << mode.ordinal();
+                }
+            }
+            if (!changed && updated == 0) return;
+            try {
+                Object event = modeChanges.newInstance();
+                for (PlaybackMode mode : modes) {
+                    playbackModes.get(mode).event.invoke(event,
+                            (updated & (1 << mode.ordinal())) != 0 ? Integer.valueOf(mode.value(next.data)) : null);
+                }
+                setExtras.invoke(manager, new Bundle());
+                for (Object listener : listeners) modesChanged.invoke(listener, adapter, event);
+            } catch (ReflectiveOperationException | RuntimeException failure) {
+                context.log("Native playback mode update failed", unwrap(failure));
+            }
         }
 
         private void notifyPosition(Object previousQueue, TrackSnapshot old, TrackSnapshot next, boolean changed) {
@@ -1070,6 +1267,17 @@ final class NativeSessionProbe implements AutoCloseable, RoleHandoff.Playback {
             TrackSnapshot current = snapshot;
             JSONObject data = current.data;
             long actions = current.actions();
+            for (PlaybackMode mode : PlaybackMode.values()) {
+                String name = method.getName();
+                if (mode.getter.equals(name)) return mode.value(data);
+                if (mode.capability.equals(name)) return mode.available(data);
+                if (mode.setter.equals(name)) {
+                    int value = mode == PlaybackMode.AUTOPLAY ? (Boolean.TRUE.equals(args[0]) ? 2 : 1)
+                            : (Integer) args[0];
+                    if (mode.available(data) && mode.accepts(value)) send(mode.route, value);
+                    return null;
+                }
+            }
             switch (method.getName()) {
                 case "toString": return "AM++ native LAN controller";
                 case "hashCode": return System.identityHashCode(proxy);
@@ -1136,7 +1344,7 @@ final class NativeSessionProbe implements AutoCloseable, RoleHandoff.Playback {
             if (!armed || closed || bridge != this) return false;
             try {
                 worker.execute(() -> {
-                    if (!armed || closed || bridge != this) return;
+                    if (!armed || exitRequested || closed || bridge != this) return;
                     int status = album != null && index >= 0 && index <= 9999
                             ? target.peer.playAlbumSong(id, album, index) : 404;
                     if (status == 404 || status == 422) status = target.peer.playCatalogSong(id);
@@ -1171,13 +1379,14 @@ final class NativeSessionProbe implements AutoCloseable, RoleHandoff.Playback {
             long remotePosition = restart ? 0 : position;
             try {
                 worker.execute(() -> {
-                    if (!armed || snapshot.data == null || ("seek".equals(remoteAction)
+                    if (!armed || exitRequested || snapshot.data == null || ("seek".equals(remoteAction)
                             && !TrackSnapshot.sameTrack(requestedTrack, snapshot.data))) return;
                     int result = target.peer.command(remoteAction, remotePosition);
                     lastReport = "收到原生 " + action + " 指令 · 接收端返回 " + result;
                     context.log(lastReport, null);
                     poll();
-                    if (result == 204 && ("seek".equals(action) || "next".equals(action) || "previous".equals(action))) {
+                    if (result == 204 && ("seek".equals(action) || "next".equals(action) || "previous".equals(action)
+                            || PlaybackMode.forRoute(action) != null)) {
                         worker.schedule(this::poll, 170, TimeUnit.MILLISECONDS);
                         worker.schedule(this::poll, 440, TimeUnit.MILLISECONDS);
                     }

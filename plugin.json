@@ -4,9 +4,9 @@
   "id": "ampp.remote.lan",
   "name": "局域网遥控",
   "author": "Codex",
-  "versionName": "0.7.2",
-  "versionCode": 25,
+  "versionName": "0.7.5",
+  "versionCode": 28,
   "entryClass": "ampp.remote.RemotePlugin",
   "minAndroidApi": 26,
-  "description": "控制端在第一首时显示上一首，点击跳回歌曲开头。"
+  "description": "同步播放端的随机、循环、单曲循环与无限续播，点专辑歌曲时保留播放端队列。"
 }

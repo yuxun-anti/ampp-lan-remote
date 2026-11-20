@@ -95,6 +95,8 @@ final class LanPeer implements LanServer.Player {
     }
 
     @Override public int command(String name, long position) {
+        PlaybackMode mode = PlaybackMode.forRoute(name);
+        if (mode != null) return mode.accepts(position) ? post("/api/" + name + "/" + position) : 400;
         final String route;
         switch (name) {
             case "seek":

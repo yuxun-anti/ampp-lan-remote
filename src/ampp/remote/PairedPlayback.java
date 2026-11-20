@@ -39,14 +39,42 @@ final class PairedPlayback {
         return hasTrack(state) && (state.optBoolean("playing") || !state.optString("following").isEmpty());
     }
 
+    static boolean outputReachable(JSONObject state) {
+        return state != null && !state.optBoolean("outputUnavailable");
+    }
+
     static JSONObject read(RemoteStore.Device device) {
         JSONObject state = readRaw(device);
         return state != null && state.optBoolean("ready") ? state : null;
     }
 
     static JSONObject readRaw(RemoteStore.Device device) {
+        return readRaw(device.peer);
+    }
+
+    static boolean pauseAndConfirm(LanServer.Player peer) {
+        JSONObject state = readRaw(peer);
+        if (!outputReachable(state) || !state.optBoolean("ready")) return false;
+        if (!state.optBoolean("playing")) return true;
+        if (peer.command("pause", -1) != 204) return false;
+        for (int attempt = 0; attempt < 4; attempt++) {
+            state = readRaw(peer);
+            if (!outputReachable(state) || !state.optBoolean("ready")) return false;
+            if (!state.optBoolean("playing")) return true;
+            if (attempt == 3) break;
+            try {
+                Thread.sleep(150);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+        return false;
+    }
+
+    private static JSONObject readRaw(LanServer.Player peer) {
         try {
-            return new JSONObject(device.peer.state());
+            return new JSONObject(peer.state());
         } catch (Exception unavailable) {
             return null;
         }

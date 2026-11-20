@@ -176,6 +176,19 @@ final class LanServer implements AutoCloseable {
         if ("POST".equals(request.method) && path.startsWith("/api/")) {
             String command = path.substring(5);
             long position = -1;
+            int separator = command.indexOf('/');
+            PlaybackMode mode = PlaybackMode.forRoute(separator < 0 ? command : command.substring(0, separator));
+            if (mode != null) {
+                String raw = separator < 0 ? "" : command.substring(separator + 1);
+                if (raw.length() != 1 || !mode.accepts(raw.charAt(0) - '0')) {
+                    reply(out, 400);
+                } else {
+                    int value = raw.charAt(0) - '0';
+                    reply(out, relay == null ? player.command(mode.route, value)
+                            : networkStatus(relay.command(mode.route, value)));
+                }
+                return;
+            }
             if (command.startsWith("seek/")) {
                 try {
                     position = Long.parseLong(command.substring(5));

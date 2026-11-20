@@ -15,7 +15,8 @@ final class Dialogs {
     static AlertDialog show(AlertDialog.Builder builder) {
         AlertDialog dialog = builder.show();
         int color = isNight(dialog.getContext()) ? 0xff80cbc4 : 0xff00695c;
-        for (int which : new int[]{AlertDialog.BUTTON_POSITIVE, AlertDialog.BUTTON_NEGATIVE}) {
+        for (int which : new int[]{AlertDialog.BUTTON_POSITIVE, AlertDialog.BUTTON_NEGATIVE,
+                AlertDialog.BUTTON_NEUTRAL}) {
             android.widget.Button button = dialog.getButton(which);
             if (button != null) button.setTextColor(color);
         }
