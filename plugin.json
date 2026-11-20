@@ -1,0 +1,12 @@
+{
+  "formatVersion": 1,
+  "apiVersion": 1,
+  "id": "ampp.remote.lan",
+  "name": "局域网遥控",
+  "author": "Codex",
+  "versionName": "0.7.2",
+  "versionCode": 25,
+  "entryClass": "ampp.remote.RemotePlugin",
+  "minAndroidApi": 26,
+  "description": "控制端在第一首时显示上一首，点击跳回歌曲开头。"
+}
