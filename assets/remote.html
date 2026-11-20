@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#191b21">
+  <title>AM++ 局域网遥控</title>
+  <link rel="stylesheet" href="/remote.css">
+  <script src="/remote.js" defer></script>
+</head>
+<body>
+  <main>
+    <header>AM++ 局域网遥控</header>
+    <section aria-label="正在播放">
+      <h1 id="title">等待连接</h1>
+      <p id="details"></p>
+      <input id="progress" aria-label="播放进度" type="range" min="0" max="1" value="0" disabled>
+      <div class="times"><span id="elapsed">–:––</span><span id="duration">–:––</span></div>
+      <div class="controls">
+        <button type="button" id="previous" disabled>上一首</button>
+        <button type="button" id="toggle" disabled>播放</button>
+        <button type="button" id="next" disabled>下一首</button>
+      </div>
+      <p role="status" id="status">正在连接接收设备…</p>
+    </section>
+  </main>
+</body>
+</html>
