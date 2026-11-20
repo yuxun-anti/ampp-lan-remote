@@ -1,0 +1,68 @@
+:root {
+  color-scheme: dark;
+  font: 16px system-ui, sans-serif;
+  background: #191b21;
+  color: #f5f4f7;
+}
+body {
+  margin: 0;
+  min-height: 100dvh;
+  display: grid;
+  place-items: center;
+}
+main {
+  margin: 1rem;
+  width: min(33rem, calc(100% - 2rem));
+}
+header {
+  margin-bottom: 0.8rem;
+  color: #c8c3ce;
+  font-size: 0.9rem;
+}
+section {
+  padding: clamp(1rem, 5vw, 2rem);
+  background: #242630;
+  border-radius: 1.25rem;
+}
+h1 {
+  font-size: clamp(1.35rem, 6vw, 2rem);
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+p {
+  margin: 0.7rem 0;
+  color: #d5cfdc;
+  overflow-wrap: anywhere;
+}
+input {
+  width: 100%;
+  margin: 1.3rem 0 0.25rem;
+  accent-color: #e5afff;
+}
+.times {
+  display: flex;
+  justify-content: space-between;
+  color: #d5cfdc;
+  font-variant-numeric: tabular-nums;
+}
+.controls {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.5rem;
+  margin: 1.5rem 0 1rem;
+}
+button {
+  min-height: 3rem;
+  border: 0;
+  border-radius: 0.8rem;
+  background: #393745;
+  color: inherit;
+  font: inherit;
+}
+#toggle {
+  background: #e5afff;
+  color: #24132e;
+  font-weight: 650;
+}
+button:disabled { opacity: 0.45; }
+#status { min-height: 1.5em; margin-bottom: 0; font-size: 0.85rem; }
