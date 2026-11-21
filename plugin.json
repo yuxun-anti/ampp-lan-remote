@@ -4,9 +4,9 @@
   "id": "ampp.remote.lan",
   "name": "局域网遥控",
   "author": "Codex",
-  "versionName": "0.8.0",
-  "versionCode": 29,
+  "versionName": "0.8.3",
+  "versionCode": 32,
   "entryClass": "ampp.remote.RemotePlugin",
   "minAndroidApi": 26,
-  "description": "已配对设备局域网自动发现、换 IP 后更新地址与重连，保留原有播放控制。"
+  "description": "从原生播放队列识别专辑，交接后显示是否接续了专辑队列。"
 }

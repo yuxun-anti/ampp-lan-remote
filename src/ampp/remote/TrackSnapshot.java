@@ -13,6 +13,7 @@ final class TrackSnapshot {
     }
 
     boolean playing() { return data != null && data.optBoolean("playing"); }
+    double rate() { return data == null ? 0.0 : Math.max(0.0, Math.min(4.0, data.optDouble("speed", 1.0))); }
     private long nativeActions() { return data == null ? 0L : data.optLong("actions"); }
 
     boolean restartsOnPrevious() {
@@ -31,8 +32,7 @@ final class TrackSnapshot {
         if (data == null) return -1L;
         long offset = data.optLong("position", -1L);
         if (offset < 0L) return -1L;
-        double rate = Math.max(0.0, Math.min(4.0, data.optDouble("speed", 1.0)));
-        if (playing()) offset += (long) (Math.max(0L, now - sampledAt) * rate);
+        if (playing()) offset += (long) (Math.max(0L, now - sampledAt) * rate());
         long duration = data.optLong("duration", -1L);
         return duration > 0L ? Math.min(offset, duration) : offset;
     }
@@ -62,5 +62,14 @@ final class TrackSnapshot {
         long before = old.position(next.sampledAt);
         long after = next.position(next.sampledAt);
         return before >= 0 && after >= 0 && Math.abs(before - after) >= 600;
+    }
+
+    static boolean wrappedAtEnd(TrackSnapshot old, TrackSnapshot next) {
+        if (old == null || !old.playing() || !next.playing()) return false;
+        long duration = old.data.optLong("duration");
+        long before = old.position(next.sampledAt);
+        long after = next.position(next.sampledAt);
+        return duration > 0 && before >= Math.max(0, duration - 1200)
+                && after >= 0 && after <= 2000 && before - after >= 600;
     }
 }

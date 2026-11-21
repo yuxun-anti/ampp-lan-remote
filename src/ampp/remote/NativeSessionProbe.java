@@ -80,6 +80,15 @@ final class NativeSessionProbe implements AutoCloseable, RoleHandoff.Playback {
     private final Method skipToQueueItem;
     private final Method engineDuration;
     private final Method containerStoreId;
+    private final Method containerType;
+    private final Method containerIndex;
+    private final Method playbackQueueIndex;
+    private final Field localPlayer;
+    private final Method playbackQueueManager;
+    private final Method nativeQueueCount;
+    private final Method nativeQueueItem;
+    private final Method nativeQueueContainerType;
+    private final Method mediaAlbumId;
     private final Field serviceHandler;
     private final Field currentField;
     private final Field switchScope;
@@ -184,6 +193,17 @@ final class NativeSessionProbe implements AutoCloseable, RoleHandoff.Playback {
         canPrevious = controller.getMethod("canSkipToPreviousItem");
         engineDuration = controller.getMethod("getDuration");
         containerStoreId = controller.getMethod("getCurrentContainerStoreId");
+        containerType = controller.getMethod("getCurrentContainerType");
+        containerIndex = controller.getMethod("getCurrentContainerIndex");
+        playbackQueueIndex = controller.getMethod("getPlaybackQueueIndex");
+        Class<?> player = type(ROOT + "playback.player.MediaPlayer");
+        Class<?> queueManager = type(ROOT + "playback.queue.PlaybackQueueManager");
+        localPlayer = field(local, "player", player);
+        playbackQueueManager = player.getMethod("getPlaybackQueueManager");
+        nativeQueueCount = queueManager.getMethod("getItemCount");
+        nativeQueueItem = queueManager.getMethod("getItemAtIndex", int.class);
+        nativeQueueContainerType = queueManager.getMethod("getContainerTypeAtIndex", int.class);
+        mediaAlbumId = media.getMethod("getAlbumSubscriptionStoreId");
         nativePrevious = playbackManager.getMethod("w");
         nativeNext = playbackManager.getMethod("y");
         nativeSeek = playbackManager.getMethod("seekTo", long.class);
@@ -318,6 +338,51 @@ final class NativeSessionProbe implements AutoCloseable, RoleHandoff.Playback {
 
     @Override public boolean supportsStaging() { return true; }
 
+    @Override public boolean supportsAlbumHandoff() { return true; }
+
+    @Override public AlbumHandoff albumQueue(JSONObject snapshot) {
+        java.util.concurrent.atomic.AtomicReference<AlbumHandoff> captured = new java.util.concurrent.atomic.AtomicReference<>();
+        Integer status = callLocal((service, engine) -> {
+            Object current = currentItem.invoke(engine);
+            if (current != null && snapshot.optString("queueEntry").equals(String.valueOf(queueId.invoke(current)))
+                    && queueSong(current, snapshot.optString("mediaId"))) {
+                captured.set(readAlbumQueue(engine, current));
+            }
+            return 204;
+        });
+        return Integer.valueOf(204).equals(status) ? captured.get() : null;
+    }
+
+    private AlbumHandoff readAlbumQueue(Object engine, Object current) throws ReflectiveOperationException {
+        if (!Integer.valueOf(1).equals(containerType.invoke(engine))
+                || !Integer.valueOf(0).equals(playbackModes.get(PlaybackMode.SHUFFLE).read.invoke(engine))) return null;
+        String id = (String) containerStoreId.invoke(engine);
+        Object media = mediaOf.invoke(current);
+        if (!CatalogPlayback.validId(id) && media != null) id = (String) mediaAlbumId.invoke(media);
+        if (!CatalogPlayback.validId(id)) return null;
+        int index = (Integer) containerIndex.invoke(engine);
+        int queueIndex = (Integer) playbackQueueIndex.invoke(engine);
+        if (index < 0 || queueIndex < 0) return null;
+        Object manager = playbackQueueManager.invoke(localPlayer.get(engine));
+        int count = (Integer) nativeQueueCount.invoke(manager);
+        if (queueIndex >= count) return null;
+        long entry = (Long) queueId.invoke(current);
+        Object atIndex = nativeQueueItem.invoke(manager, queueIndex);
+        if (atIndex == null || (Long) queueId.invoke(atIndex) != entry) return null;
+        long provider = entry >>> 32; // AM 1614 stores the queue provider ID in the high bits.
+        List<String> songs = new java.util.ArrayList<>();
+        for (int nextIndex = queueIndex + 1; nextIndex < count; nextIndex++) {
+            if (Integer.valueOf(6).equals(nativeQueueContainerType.invoke(manager, nextIndex))) break;
+            Object item = nativeQueueItem.invoke(manager, nextIndex);
+            if (item == null || ((Long) queueId.invoke(item) >>> 32) != provider) return null;
+            Object next = mediaOf.invoke(item);
+            if (next == null) return null;
+            songs.add((String) storeId.invoke(next));
+        }
+        int repeat = (Integer) playbackModes.get(PlaybackMode.REPEAT).read.invoke(engine);
+        return AlbumHandoff.fromQueue(id, index, repeat, songs.size(), songs);
+    }
+
     @Override public int take(String id, long position, boolean playing) {
         int status = stage(id);
         if (status == 204) status = commit(id, position, playing);
@@ -326,6 +391,10 @@ final class NativeSessionProbe implements AutoCloseable, RoleHandoff.Playback {
     }
 
     @Override public int stage(String id) {
+        return stage(id, null);
+    }
+
+    @Override public int stage(String id, AlbumHandoff albumQueue) {
         previousStageDevice = remoteDevice();
         takingPlayback = true;
         try {
@@ -348,14 +417,35 @@ final class NativeSessionProbe implements AutoCloseable, RoleHandoff.Playback {
                 }, true);
             });
             if (!localReady.get(8, TimeUnit.SECONDS)) return 409;
+            java.util.concurrent.atomic.AtomicReference<String> previousEntry = new java.util.concurrent.atomic.AtomicReference<>("");
             Integer prepared = callLocal((service, engine) -> {
-                if (Integer.valueOf(1).equals(currentState.invoke(engine))) return 409;
-                catalogPlayback.prepare(engine, id, false);
+                int state = (Integer) currentState.invoke(engine);
+                if (state == 1) return 409;
+                if (albumQueue == null) {
+                    catalogPlayback.prepare(engine, id, false);
+                } else {
+                    Object current = currentItem.invoke(engine);
+                    if (state != 0 && queueSong(current, id) && albumQueue.matches(readAlbumQueue(engine, current))) {
+                        return 200;
+                    }
+                    if (current != null) previousEntry.set(String.valueOf(queueId.invoke(current)));
+                    catalogPlayback.prepareAlbumHandoff(engine, albumQueue);
+                }
                 return 204;
             });
-            if (!Integer.valueOf(204).equals(prepared)) return 409;
-            return awaitState(state -> id.equals(state.optString("mediaId"))
-                    && !state.optBoolean("playing") && state.optLong("duration") > 0, 5500) != null ? 204 : 422;
+            boolean reused = Integer.valueOf(200).equals(prepared);
+            if (!reused && !Integer.valueOf(204).equals(prepared)) return 409;
+            JSONObject loaded = awaitState(state -> id.equals(state.optString("mediaId"))
+                    && !state.optBoolean("playing") && state.optLong("duration") > 0
+                    && (albumQueue == null || albumQueue.id.equals(state.optString("containerId"))
+                    && (reused || !previousEntry.get().equals(state.optString("queueEntry")))), 5500);
+            if (loaded == null) return 422;
+            if (albumQueue == null) return 204;
+            if (albumQueue.repeat != loaded.optInt("repeat")) {
+                if (!Integer.valueOf(204).equals(transportLocal("repeat", albumQueue.repeat))) return 422;
+            }
+            return awaitState(state -> id.equals(state.optString("mediaId")) && !state.optBoolean("playing")
+                    && albumQueue.matches(albumQueue(state)), 1400) != null ? 204 : 422;
         } catch (InterruptedException cancelled) {
             Thread.currentThread().interrupt();
             return 503;
@@ -365,9 +455,14 @@ final class NativeSessionProbe implements AutoCloseable, RoleHandoff.Playback {
     }
 
     @Override public int commit(String id, long position, boolean playing) {
+        return commit(id, position, playing, null);
+    }
+
+    @Override public int commit(String id, long position, boolean playing, AlbumHandoff albumQueue) {
         JSONObject loaded = sampleLocal();
         if (loaded == null || !id.equals(loaded.optString("mediaId"))) return 422;
         if (loaded.optBoolean("playing")) return 503;
+        if (albumQueue != null && !albumQueue.matches(albumQueue(loaded))) return 422;
         long seek = Math.min(position, Math.max(0L, loaded.optLong("duration") - 1));
         if (seek > 0 || loaded.optLong("position") > 500) {
             if (awaitState(state -> id.equals(state.optString("mediaId")) && !state.optBoolean("playing")
@@ -375,6 +470,13 @@ final class NativeSessionProbe implements AutoCloseable, RoleHandoff.Playback {
             if (!Integer.valueOf(204).equals(transportLocal("seek", seek))) return 422;
             if (awaitState(state -> id.equals(state.optString("mediaId")) && !state.optBoolean("playing")
                     && Math.abs(state.optLong("position", -1000) - seek) <= 500, 2100) == null) return 422;
+        }
+        if (albumQueue != null) {
+            JSONObject positioned = sampleLocal();
+            if (positioned == null || !id.equals(positioned.optString("mediaId"))
+                    || !loaded.optString("queueEntry").equals(positioned.optString("queueEntry"))
+                    || !albumQueue.matches(albumQueue(positioned))) return 422;
+            if (positioned.optBoolean("playing")) return 503;
         }
         if (playing && !setPlaying(true)) return 503;
         takingPlayback = false;
@@ -791,10 +893,10 @@ final class NativeSessionProbe implements AutoCloseable, RoleHandoff.Playback {
             extras.putBoolean(REMOTE, true);
             setExtras.invoke(entry.manager, extras);
             entry.startCard();
+            entry.poll = worker.scheduleWithFixedDelay(entry::pollSafely, 160, 650, TimeUnit.MILLISECONDS);
             entry.publish(true);
             result(report, "已接入「" + entry.target.name + "」。可在原生播放页"
                     + (entry.card == null ? "" : "或通知栏") + "操作。");
-            entry.poll = worker.scheduleWithFixedDelay(entry::poll, 160, 650, TimeUnit.MILLISECONDS);
         } catch (ReflectiveOperationException | RuntimeException failure) {
             context.log("Native controller confirmation failed", unwrap(failure));
             result(report, "播放服务未确认完整状态。可退出测试或重启 Apple Music。");
@@ -1057,13 +1159,24 @@ final class NativeSessionProbe implements AutoCloseable, RoleHandoff.Playback {
         }
 
         void updateCard() {
+            updateCard(snapshot, shownArtwork);
+        }
+
+        private void updateCard(TrackSnapshot sample, String artwork) {
             RemoteMediaCard current = card;
             if (current == null) return;
             try {
-                current.update(snapshot, shownArtwork);
+                current.update(sample, artwork);
             } catch (RuntimeException unavailable) {
                 context.log("Remote notification update failed", unavailable);
-                closeCard();
+            }
+        }
+
+        private void pollSafely() {
+            try {
+                poll();
+            } catch (RuntimeException failure) {
+                context.log("Remote playback polling failed", failure);
             }
         }
 
@@ -1093,7 +1206,7 @@ final class NativeSessionProbe implements AutoCloseable, RoleHandoff.Playback {
         }
 
         void accept(TrackSnapshot next) {
-            if (!armed) return;
+            if (!armed || exitRequested || closed || bridge != this) return;
             TrackSnapshot old = snapshot;
             Object previousQueue = queue;
             Object replacement = queue;
@@ -1107,8 +1220,8 @@ final class NativeSessionProbe implements AutoCloseable, RoleHandoff.Playback {
                     replacement = nativeTrack.item(next.data, id);
                 } catch (ReflectiveOperationException | RuntimeException failure) {
                     context.log("Native remote metadata unavailable", unwrap(failure));
-                    next = new TrackSnapshot(null, next.sampledAt);
-                    trackChanged = false;
+                    updateCard(next, NativeTrack.appleArtwork(next.data.optString("artworkUrl")));
+                    return;
                 }
             }
             if (trackChanged) {
@@ -1120,14 +1233,14 @@ final class NativeSessionProbe implements AutoCloseable, RoleHandoff.Playback {
                 lastTrack = next.data;
             }
             snapshot = next;
-            notifyNative(false, trackChanged, previousQueue, old);
             updateCard();
+            notifyNative(false, trackChanged, previousQueue, old);
             if (next.data != null) updateArtwork(next.data);
         }
 
         void publish(boolean initial) {
-            notifyNative(initial, false, null, null);
             updateCard();
+            notifyNative(initial, false, null, null);
             if (snapshot.data != null) updateArtwork(snapshot.data);
         }
 

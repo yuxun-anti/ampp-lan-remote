@@ -5,6 +5,7 @@ import android.content.res.ColorStateList;
 import android.graphics.Canvas;
 import android.graphics.Paint;
 import android.graphics.Color;
+import android.graphics.ColorFilter;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.RippleDrawable;
 import android.os.Bundle;
@@ -108,6 +109,8 @@ final class PlayerDeviceButton implements AutoCloseable {
         View anchor = full ? find(root, "list_favorite_icon")
                 : queue != null ? queue : find(root, "mini_player_play_btn");
         if (!(anchor instanceof ImageView) || !(anchor.getParent() instanceof ViewGroup)) return;
+        View play = full ? null : find(root, "mini_player_play_btn");
+        ImageView colorSource = (ImageView) (play instanceof ImageView ? play : anchor);
         ViewGroup parent = (ViewGroup) anchor.getParent();
         if (!params.getDeclaringClass().isInstance(anchor.getLayoutParams())) return;
         Context context = anchor.getContext();
@@ -121,6 +124,8 @@ final class PlayerDeviceButton implements AutoCloseable {
         int gap = wide ? deviceGap((ImageView) anchor, parent.findViewById(moreId), fullWidth) : 0;
         DeviceIcon existing = parent.findViewWithTag(TAG);
         if (existing != null) {
+            existing.colorSource = colorSource;
+            existing.syncColor();
             updateOutputLabel(existing);
             if (existing.favoriteSpace != null) {
                 existing.favoriteSpace.apply(fullWidth + gap);
@@ -141,7 +146,7 @@ final class PlayerDeviceButton implements AutoCloseable {
             for (Field constraint : vertical) constraint.setInt(buttonParams, constraint.getInt(anchorParams));
         }
         TextView label = root.findViewById(resource(context, "id", full ? "title" : "mini_player_title"));
-        DeviceIcon button = new DeviceIcon(context, (ImageView) anchor, label);
+        DeviceIcon button = new DeviceIcon(context, colorSource, label, !full);
         button.setId(View.generateViewId());
         button.setTag(TAG);
         updateOutputLabel(button);
@@ -380,22 +385,60 @@ final class PlayerDeviceButton implements AutoCloseable {
     }
 
     private static final class DeviceIcon extends ImageButton {
-        private final ImageView sibling;
+        private ImageView colorSource;
         private final TextView label;
+        private final boolean followPlayTint;
+        private final ViewTreeObserver.OnPreDrawListener tintWatcher = () -> {
+            syncColor();
+            return true;
+        };
         private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final java.util.List<Runnable> restoreLinks = new java.util.ArrayList<>();
         private FavoriteSpace favoriteSpace;
         private View subtitle;
         private Boolean boundedFeedback;
 
-        DeviceIcon(Context context, ImageView sibling, TextView label) {
+        DeviceIcon(Context context, ImageView colorSource, TextView label, boolean followPlayTint) {
             super(context);
-            this.sibling = sibling;
+            this.colorSource = colorSource;
             this.label = label;
+            this.followPlayTint = followPlayTint;
             paint.setStyle(Paint.Style.STROKE);
             paint.setStrokeCap(Paint.Cap.ROUND);
             paint.setStrokeJoin(Paint.Join.ROUND);
             paint.setStrokeWidth(1.65f);
+        }
+
+        @Override protected void onAttachedToWindow() {
+            super.onAttachedToWindow();
+            if (followPlayTint) getViewTreeObserver().addOnPreDrawListener(tintWatcher);
+        }
+
+        @Override protected void onDetachedFromWindow() {
+            if (followPlayTint) getViewTreeObserver().removeOnPreDrawListener(tintWatcher);
+            super.onDetachedFromWindow();
+        }
+
+        private void syncColor() {
+            if (applySourceTint()) invalidate();
+        }
+
+        private boolean applySourceTint() {
+            ColorFilter filter = null;
+            ColorStateList tint = colorSource.getImageTintList();
+            if (followPlayTint) {
+                filter = colorSource.getColorFilter();
+                if (filter == null && colorSource.getDrawable() != null) {
+                    filter = colorSource.getDrawable().getColorFilter();
+                }
+            }
+            int color = label == null ? 0xff888888 : label.getCurrentTextColor();
+            if (filter != null) color = Color.WHITE;
+            else if (tint != null) color = tint.getColorForState(colorSource.getDrawableState(), tint.getDefaultColor());
+            if (paint.getColor() == color && java.util.Objects.equals(paint.getColorFilter(), filter)) return false;
+            paint.setColor(color);
+            paint.setColorFilter(filter);
+            return true;
         }
 
         void feedback(boolean bounded) {
@@ -448,9 +491,7 @@ final class PlayerDeviceButton implements AutoCloseable {
 
         @Override protected void onDraw(Canvas canvas) {
             super.onDraw(canvas);
-            ColorStateList tint = sibling.getImageTintList();
-            paint.setColor(tint != null ? tint.getDefaultColor() : label == null ? 0xff888888
-                    : label.getCurrentTextColor());
+            applySourceTint();
             float size = getResources().getDisplayMetrics().density;
             canvas.save();
             canvas.translate((getWidth() - 24 * size) / 2, (getHeight() - 24 * size) / 2);

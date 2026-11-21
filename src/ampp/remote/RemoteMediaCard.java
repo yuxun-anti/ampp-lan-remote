@@ -58,6 +58,9 @@ final class RemoteMediaCard implements AutoCloseable {
     private boolean receiverInstalled;
     private boolean closed;
     private boolean attempted;
+    private boolean notificationPending;
+    private TrackSnapshot publishedSample;
+    private String mediaId = "";
     private String title = "";
     private String artist = "";
     private String album = "";
@@ -138,10 +141,11 @@ final class RemoteMediaCard implements AutoCloseable {
         int nowState = data == null ? PlaybackState.STATE_ERROR : sample.playing()
                 ? PlaybackState.STATE_PLAYING : PlaybackState.STATE_PAUSED;
         long buttons = sample.actions() & KNOWN_ACTIONS;
-        boolean notify = !attempted || status != nowState || actions != buttons;
+        notificationPending |= !attempted || status != nowState || actions != buttons;
+        notificationPending |= TrackSnapshot.wrappedAtEnd(publishedSample, sample);
         if (data != null) {
             String currentDevice = data.optString("outputName", device);
-            notify |= !currentDevice.equals(notifiedDevice);
+            notificationPending |= !currentDevice.equals(notifiedDevice);
             notifiedDevice = currentDevice;
         }
         status = nowState;
@@ -151,37 +155,49 @@ final class RemoteMediaCard implements AutoCloseable {
         String newArtist = data == null ? artist : data.optString("artist");
         String newAlbum = data == null ? album : data.optString("album");
         long newDuration = data == null ? duration : Math.max(0, data.optLong("duration", 0));
+        String newMediaId = data == null ? mediaId : mediaId(data);
         boolean artChanged = !Objects.equals(coverPath, artwork);
-        if (artChanged) {
-            artwork = coverPath;
-            cover = localCover(coverPath);
-        }
-        if (!attempted || artChanged || !title.equals(newTitle) || !artist.equals(newArtist)
+        if (!attempted || artChanged || !mediaId.equals(newMediaId) || !title.equals(newTitle) || !artist.equals(newArtist)
                 || !album.equals(newAlbum) || duration != newDuration) {
+            Bitmap newCover = artChanged ? localCover(coverPath) : cover;
+            MediaMetadata.Builder metadata = new MediaMetadata.Builder()
+                    .putString(MediaMetadata.METADATA_KEY_MEDIA_ID, newMediaId)
+                    .putString(MediaMetadata.METADATA_KEY_TITLE, newTitle)
+                    .putString(MediaMetadata.METADATA_KEY_ARTIST, newArtist)
+                    .putString(MediaMetadata.METADATA_KEY_ALBUM, newAlbum)
+                    .putLong(MediaMetadata.METADATA_KEY_DURATION, newDuration);
+            if (newCover != null) metadata.putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, newCover);
+            session.setMetadata(metadata.build());
+            mediaId = newMediaId;
             title = newTitle;
             artist = newArtist;
             album = newAlbum;
             duration = newDuration;
-            MediaMetadata.Builder metadata = new MediaMetadata.Builder()
-                    .putString(MediaMetadata.METADATA_KEY_TITLE, title)
-                    .putString(MediaMetadata.METADATA_KEY_ARTIST, artist)
-                    .putString(MediaMetadata.METADATA_KEY_ALBUM, album)
-                    .putLong(MediaMetadata.METADATA_KEY_DURATION, duration);
-            if (cover != null) metadata.putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, cover);
-            session.setMetadata(metadata.build());
-            notify = true;
+            artwork = coverPath;
+            cover = newCover;
+            notificationPending = true;
         }
 
         long now = SystemClock.elapsedRealtime();
         PlaybackState.Builder state = new PlaybackState.Builder()
                 .setActions(buttons)
-                .setState(nowState, sample.position(now), sample.playing() ? 1f : 0f, now);
+                .setState(nowState, sample.position(now), sample.playing() ? (float) sample.rate() : 0f, now);
         if (data == null) state.setErrorMessage("播放设备暂时离线");
         session.setPlaybackState(state.build());
-        if (notify) {
+        publishedSample = sample;
+        if (notificationPending) {
             postNotification();
             attempted = true;
+            notificationPending = false;
         }
+    }
+
+    private static String mediaId(JSONObject data) {
+        String id = data.optString("mediaId");
+        if (id.isEmpty() || "0".equals(id)) {
+            id = data.optString("title") + "\n" + data.optString("artist") + "\n" + data.optString("album");
+        }
+        return "ampp-remote:" + data.optString("queueEntry") + ":" + id;
     }
 
     private void postNotification() {
@@ -250,9 +266,15 @@ final class RemoteMediaCard implements AutoCloseable {
 
     private static Bitmap localCover(String url) {
         if (url == null || !url.startsWith("file:///")) return null;
+        String path = Uri.parse(url).getPath();
         BitmapFactory.Options size = new BitmapFactory.Options();
-        size.inSampleSize = 2;
-        return BitmapFactory.decodeFile(Uri.parse(url).getPath(), size);
+        size.inJustDecodeBounds = true;
+        BitmapFactory.decodeFile(path, size);
+        size.inSampleSize = 1;
+        int edge = Math.max(size.outWidth, size.outHeight);
+        while (edge / size.inSampleSize > 384) size.inSampleSize *= 2;
+        size.inJustDecodeBounds = false;
+        return BitmapFactory.decodeFile(path, size);
     }
 
     @Override public synchronized void close() {

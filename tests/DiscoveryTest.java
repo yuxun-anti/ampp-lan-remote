@@ -85,7 +85,7 @@ public final class DiscoveryTest {
         System.out.println("Discovery authentication, endpoint migration, live session, selection, removal: PASS");
     }
 
-    private static LanPeer loopbackPeer(String url) throws Exception {
+    static LanPeer loopbackPeer(String url) throws Exception {
         // Production parsing continues to reject loopback. This test-only constructor permits local HTTP tests.
         java.lang.reflect.Constructor<LanPeer> constructor = LanPeer.class.getDeclaredConstructor(
                 java.net.URI.class, InetAddress.class);

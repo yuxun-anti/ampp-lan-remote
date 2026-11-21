@@ -163,11 +163,12 @@ final class DevicePicker implements AutoCloseable {
                 if (destination == null || role != null) {
                     String target = destination == null ? node : role.optString("node");
                     if (source == null) {
-                        status = roles.move(target);
+                        status = roles.moveDetailed(target);
                     } else if (destination == null && source.peer.role() == null) {
                         status = 0;
                     } else {
-                        status = source.peer.changeRole("move/" + target, 46000);
+                        status = source.peer.changeRole("move-detail/" + target, RoleHandoff.MOVE_TIMEOUT);
+                        if (status == 400) status = source.peer.changeRole("move/" + target, RoleHandoff.MOVE_TIMEOUT);
                     }
                 }
             } finally {
@@ -193,11 +194,12 @@ final class DevicePicker implements AutoCloseable {
 
     private static String message(int status, RemoteStore.Device destination) {
         switch (status) {
-            case 204: return "播放已切换到「" + (destination == null ? "本机" : destination.name) + "」。";
+            case 200: return "已切换到「" + (destination == null ? "本机" : destination.name) + "」，专辑队列已接续。";
+            case 204: return "已切换到「" + (destination == null ? "本机" : destination.name) + "」，已接续当前曲目。";
             case 404: return "请确认当前播放设备也已配对目标设备，且目标设备已开启局域网接收。";
             case 409: return "目标暂时无法接管。请确认它当前处于遥控或暂停状态。";
             case 412: return "目标设备未接管，已恢复原播放设备。";
-            case 422: return "当前曲目或进度无法在目标设备恢复。";
+            case 422: return "目标设备无法恢复当前曲目、专辑队列或进度。";
             default: return "未确认播放交接。请检查两台设备的连接和插件版本。";
         }
     }

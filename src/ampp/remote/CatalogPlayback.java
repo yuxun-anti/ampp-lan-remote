@@ -31,6 +31,7 @@ final class CatalogPlayback {
     private final Method build;
     private final Method prepare;
     private final Method albumStart;
+    private final Method globalShuffle;
     private final Class<?> collectionItem;
 
     CatalogPlayback(ClassLoader loader, Class<?> controller, Class<?> media) throws ReflectiveOperationException {
@@ -56,6 +57,7 @@ final class CatalogPlayback {
         setExplicitAllowed = storeBuilder.getMethod("setIsExplicitAllowed", Boolean.class);
         build = storeBuilder.getMethod("build");
         albumStart = storeBuilder.getMethod("startItemIndex", int.class);
+        globalShuffle = storeBuilder.getMethod("globalShuffleMode", int.class);
         prepare = controller.getMethod("prepare", provider, int.class, boolean.class);
     }
 
@@ -123,8 +125,18 @@ final class CatalogPlayback {
     }
 
     void prepare(Object controller, String id, int index, boolean playing) throws ReflectiveOperationException {
+        prepare(controller, id, index, playing, false);
+    }
+
+    void prepareAlbumHandoff(Object controller, AlbumHandoff album) throws ReflectiveOperationException {
+        prepare(controller, album.id, album.index, false, true);
+    }
+
+    private void prepare(Object controller, String id, int index, boolean playing, boolean ordered)
+            throws ReflectiveOperationException {
         Object request = builder.newInstance((Object) new String[]{id});
         if (index >= 0) albumStart.invoke(request, index);
+        if (ordered) globalShuffle.invoke(request, 0);
         setExplicitAllowed.invoke(request, explicitAllowed.invoke(null));
         Object provider = build.invoke(request);
         prepare.invoke(controller, provider, REPLACE_QUEUE, playing);
