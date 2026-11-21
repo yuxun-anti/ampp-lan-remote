@@ -47,6 +47,9 @@ final class LanServer implements AutoCloseable {
     private final Map<String, byte[]> assets;
     private final String token;
     private final String authority;
+    private volatile String node = "";
+
+    void identity(String identity) { node = identity; }
 
     static String newToken() {
         byte[] random = new byte[24];
@@ -128,9 +131,19 @@ final class LanServer implements AutoCloseable {
             reply(out, 200, type, assets.get(path));
             return;
         }
+        if ("GET".equals(request.method) && path.matches("/api/discovery/[0-9a-f]{32}")) {
+            String identity = node;
+            String proof = DiscoveryIdentity.proof(token, path.substring("/api/discovery/".length()), identity, authority);
+            reply(out, 200, "application/json", bytes("{\"node\":\"" + identity + "\",\"proof\":\"" + proof + "\"}"));
+            return;
+        }
         String auth = request.headers.get("authorization");
         if (auth == null || !MessageDigest.isEqual(bytes("Bearer " + token), bytes(auth))) {
             reply(out, 401);
+            return;
+        }
+        if ("GET".equals(request.method) && "/api/identity".equals(path)) {
+            reply(out, 200, "application/json", bytes("{\"node\":\"" + node + "\"}"));
             return;
         }
         if ("GET".equals(request.method) && "/api/state".equals(path)) {

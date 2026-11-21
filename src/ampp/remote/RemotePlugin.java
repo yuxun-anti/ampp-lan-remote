@@ -37,6 +37,10 @@ public final class RemotePlugin extends AmppPlugin {
     private RoleHandoff roles;
     private DevicePicker picker;
     private PlayerDeviceButton playerButtons;
+    private LanDiscovery discovery;
+    private volatile boolean stopped;
+    private final java.util.concurrent.ScheduledExecutorService networkMonitor =
+            java.util.concurrent.Executors.newSingleThreadScheduledExecutor();
 
     @Override public void onLoad(PluginContext context) throws IOException {
         store = new RemoteStore(context.getDataDirectory());
@@ -70,27 +74,41 @@ public final class RemotePlugin extends AmppPlugin {
                 context.log("Native playback device button unavailable", unavailable);
             }
         }
+        try {
+            discovery = new LanDiscovery(context.getApplication(), store, node);
+        } catch (RuntimeException | LinkageError unavailable) {
+            context.log("LAN discovery unavailable; manual pairing remains available", unavailable);
+        }
         restoreReceiver(context);
+        networkMonitor.scheduleWithFixedDelay(() -> restoreReceiver(context), 3, 3,
+                java.util.concurrent.TimeUnit.SECONDS);
         context.onClose(this::onStop);
     }
 
-    private void restoreReceiver(PluginContext context) {
+    private synchronized void restoreReceiver(PluginContext context) {
+        if (stopped) return;
         String savedAddress = store.receiverAddress();
         if (savedAddress.isEmpty()) return;
         try {
-            for (Inet4Address address : localAddresses()) {
+            List<Inet4Address> addresses = localAddresses();
+            for (Inet4Address address : addresses) {
                 if (savedAddress.equals(address.getHostAddress())) {
                     start(address, true);
                     return;
                 }
             }
+            stopReceiving();
+            if (!addresses.isEmpty()) start(addresses.get(0), true);
         } catch (IOException | RuntimeException unavailable) {
             context.log("Saved LAN receiver could not be restored", unavailable);
         }
     }
 
     @Override public void onStop() {
+        stopped = true;
+        networkMonitor.shutdownNow();
         stopReceiving();
+        if (discovery != null) discovery.close();
         if (playerButtons != null) playerButtons.close();
         if (picker != null) picker.close();
         if (probe != null) probe.close();
@@ -98,6 +116,7 @@ public final class RemotePlugin extends AmppPlugin {
     }
 
     private synchronized void stopReceiving() {
+        if (discovery != null) discovery.advertise(0, "");
         if (server != null) {
             server.close();
             server = null;
@@ -112,6 +131,25 @@ public final class RemotePlugin extends AmppPlugin {
         layout.setPadding(padding, padding, padding, padding);
         scroll.addView(layout);
         ControlPanel controls = new ControlPanel(context, layout, store, player);
+        final Runnable[] discoveryRefresh = new Runnable[1];
+        if (discovery != null) {
+            TextView discoveryStatus = new TextView(context);
+            layout.addView(discoveryStatus);
+            Button scan = new Button(context);
+            scan.setText("重新发现已配对设备");
+            layout.addView(scan);
+            discoveryRefresh[0] = new Runnable() {
+                @Override public void run() {
+                    discoveryStatus.setText(discovery.status());
+                    scroll.postDelayed(this, 1500);
+                }
+            };
+            scroll.post(discoveryRefresh[0]);
+            scan.setOnClickListener(view -> {
+                discovery.rescan();
+                discoveryStatus.setText(discovery.status() + "\n已请求重新查找，连接地址会自动更新。");
+            });
+        }
 
         Button reception = new Button(context);
         reception.setText("本机接收与配对地址");
@@ -125,7 +163,7 @@ public final class RemotePlugin extends AmppPlugin {
 
         TextView instructions = new TextView(context);
         instructions.setTextSize(16);
-        instructions.setText("开启接收后，把完整配对地址填到同一局域网内另一台设备的 AM++「添加设备」。请在可信网络使用。");
+        instructions.setText("首次配对时，把完整地址填到另一台设备的「添加设备」。两端更新后，已配对设备换 IP 可自动找到。请在可信网络使用。");
         receiver.addView(instructions);
 
         Spinner network = new Spinner(context);
@@ -222,8 +260,10 @@ public final class RemotePlugin extends AmppPlugin {
             status.setText("");
             if (activeUrl() != null) {
                 try {
-                    store.receiverAddress("");
-                    stopReceiving();
+                    synchronized (RemotePlugin.this) {
+                        store.receiverAddress("");
+                        stopReceiving();
+                    }
                     refresh.run();
                 } catch (IOException error) {
                     status.setText("保存关闭设置失败。");
@@ -261,8 +301,10 @@ public final class RemotePlugin extends AmppPlugin {
                 .setNegativeButton("取消", null)
                 .setPositiveButton("更换", (dialog, which) -> {
                     try {
-                        store.receivers(store.port(), LanServer.newToken(), "");
-                        stopReceiving();
+                        synchronized (RemotePlugin.this) {
+                            store.receivers(store.port(), LanServer.newToken(), "");
+                            stopReceiving();
+                        }
                         status.setText("已更换配对码。重新开启接收后可复制新地址。");
                         refresh.run();
                         render.run();
@@ -274,6 +316,7 @@ public final class RemotePlugin extends AmppPlugin {
         return new PluginSettingsSession() {
             @Override public View getView() { return scroll; }
             @Override public void close() {
+                if (discoveryRefresh[0] != null) scroll.removeCallbacks(discoveryRefresh[0]);
                 controls.close();
                 automatic.setOnClickListener(null);
                 join.setOnClickListener(null);
@@ -287,6 +330,7 @@ public final class RemotePlugin extends AmppPlugin {
     }
 
     private synchronized void start(Inet4Address bind, boolean restoring) throws IOException {
+        if (stopped) return;
         if (activeUrl() != null) return;
         String token = store.token();
         if (!token.matches("[A-Za-z0-9_-]{32}")) token = LanServer.newToken();
@@ -294,12 +338,14 @@ public final class RemotePlugin extends AmppPlugin {
         try {
             started = new LanServer(bind, store.port(), token, player, assets, roles);
         } catch (java.net.BindException busy) {
-            if (restoring || store.port() == 0) throw busy;
+            if (store.port() == 0) throw busy;
             started = new LanServer(bind, 0, token, player, assets, roles);
         }
         try {
+            started.identity(store.node());
             store.receivers(started.port(), token, bind.getHostAddress());
             server = started;
+            if (discovery != null) discovery.advertise(started.port(), token);
         } catch (IOException failure) {
             started.close();
             throw failure;

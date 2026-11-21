@@ -14,6 +14,7 @@ import org.json.JSONObject;
 final class RemoteStore {
     private final AtomicFile file;
     private volatile JSONObject values;
+    private final java.util.Map<String, LanPeer> peers = new java.util.HashMap<>();
 
     RemoteStore(File directory) {
         file = new AtomicFile(new File(directory, "devices.json"));
@@ -57,6 +58,11 @@ final class RemoteStore {
             if (item == null) continue;
             try {
                 LanPeer peer = LanPeer.parse(item.getString("address"));
+                LanPeer shared = peers.get(peer.credential());
+                if (shared == null) {
+                    peer.node = item.optString("node");
+                    peers.put(peer.credential(), peer);
+                } else peer = shared;
                 result.add(new Device(item.getString("name"), peer));
             } catch (IOException | JSONException invalid) {
                 // Ignore a malformed saved entry.
@@ -84,15 +90,54 @@ final class RemoteStore {
                 JSONObject item = new JSONObject();
                 item.put("name", device.name);
                 item.put("address", device.peer.address);
+                item.put("node", device.peer.node);
                 array.put(item);
             }
             JSONObject updated = copy();
             updated.put("devices", array);
             updated.put("selected", selected);
             write(updated);
+            java.util.Set<String> retained = new java.util.HashSet<>();
+            for (Device device : devices) {
+                retained.add(device.peer.credential());
+                if (!peers.containsKey(device.peer.credential())) peers.put(device.peer.credential(), device.peer);
+            }
+            peers.keySet().retainAll(retained);
         } catch (JSONException error) {
             throw new IOException(error);
         }
+    }
+
+    synchronized LanPeer pairing(LanPeer candidate) {
+        LanPeer current = peers.get(candidate.credential());
+        if (current == null) {
+            peers.put(candidate.credential(), candidate);
+            return candidate;
+        }
+        if (!current.address.equals(candidate.address)) current.relocate(candidate, current.node);
+        return current;
+    }
+
+    synchronized boolean discovered(LanPeer paired, LanPeer candidate, String node) throws IOException {
+        List<Device> devices = devices();
+        LanPeer current = null;
+        for (Device device : devices) {
+            if (device.peer.credential().equals(paired.credential())) current = device.peer;
+        }
+        if (current == null || !DiscoveryIdentity.accepts(current.node, node, node)) return false;
+        if (current.address.equals(candidate.address) && current.node.equals(node)) return true;
+        String selection = selected();
+        boolean selected = current.authority.equals(selection);
+        String oldAddress = current.address;
+        String oldNode = current.node;
+        current.relocate(candidate, node);
+        try {
+            devices(devices, selected ? current.authority : selection);
+        } catch (IOException error) {
+            current.relocate(LanPeer.parse(oldAddress), oldNode);
+            throw error;
+        }
+        return true;
     }
 
     synchronized String node() throws IOException {

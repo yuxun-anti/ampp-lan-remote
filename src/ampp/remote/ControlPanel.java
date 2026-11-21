@@ -128,7 +128,7 @@ final class ControlPanel implements AutoCloseable {
         items[0] = "本机";
         for (int i = 0; i < devices.size(); i++) {
             RemoteStore.Device item = devices.get(i);
-            items[i + 1] = item.name + " · " + item.peer.authority;
+            items[i + 1] = item.name + " · " + item.peer.connectionLabel() + " · " + item.peer.authority;
         }
         dialog = Dialogs.show(Dialogs.builder(context)
                 .setTitle("选择要控制的设备")
@@ -170,7 +170,7 @@ final class ControlPanel implements AutoCloseable {
         pairing.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> {
             LanPeer peer;
             try {
-                peer = LanPeer.parse(address.getText().toString());
+                peer = store.pairing(LanPeer.parse(address.getText().toString()));
             } catch (IOException invalid) {
                 address.setError("请输入接收设备显示的完整地址，包含端口和 # 后的配对码");
                 return;

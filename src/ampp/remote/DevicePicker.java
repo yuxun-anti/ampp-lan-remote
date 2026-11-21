@@ -82,21 +82,31 @@ final class DevicePicker implements AutoCloseable {
             builder.setNeutralButton("退出遥控", (sheet, unused) -> returnToLocal(context));
         }
         AlertDialog dialog = Dialogs.show(builder);
-        worker.execute(() -> {
+        Runnable[] refresh = new Runnable[1];
+        refresh[0] = () -> {
+            if (closed || !dialog.isShowing()) return;
+            worker.execute(() -> {
             for (int i = 0; i < names.length && !Thread.currentThread().isInterrupted(); i++) {
-                if (i == checked) continue;
                 int index = i;
                 RemoteStore.Device candidate = i == 0 ? null : paired.get(i - 1);
-                Choice status = checkChoice(source, candidate);
+                Choice status = i == checked ? null : checkChoice(source, candidate);
+                String currentStatus = candidate == null ? "本机模式"
+                        : "当前播放设备 · " + candidate.peer.connectionLabel();
                 main.post(() -> {
                     if (!dialog.isShowing()) return;
-                    labels[index] = names[index] + " · " + status.label;
-                    available[index] = status.enabled;
+                    labels[index] = names[index] + " · " + (status == null ? currentStatus : status.label);
+                    available[index] = status != null && status.enabled;
                     canJoin[index] = status == Choice.JOIN;
                     rows.notifyDataSetChanged();
                 });
             }
-        });
+            main.post(() -> {
+                if (!closed && dialog.isShowing()) main.postDelayed(refresh[0], 3000);
+            });
+            });
+        };
+        dialog.setOnDismissListener(ignored -> main.removeCallbacks(refresh[0]));
+        refresh[0].run();
     }
 
     private enum Choice {

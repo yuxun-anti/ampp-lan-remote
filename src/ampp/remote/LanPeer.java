@@ -15,11 +15,14 @@ import java.util.regex.Pattern;
 final class LanPeer implements LanServer.Player {
     private static final Pattern IPV4 = Pattern.compile("(?:[0-9]{1,3}\\.){3}[0-9]{1,3}");
     private static final Pattern TOKEN = Pattern.compile("[A-Za-z0-9_-]{32}");
-    final String address;
-    final String authority;
+    volatile String address;
+    volatile String authority;
+    private volatile LanPeer endpoint;
     private final InetAddress host;
     private final int port;
     private final String token;
+    volatile String node = "";
+    private volatile int lastStatus = -1;
 
     private LanPeer(URI uri, InetAddress host) {
         address = uri.toString();
@@ -27,6 +30,38 @@ final class LanPeer implements LanServer.Player {
         this.host = host;
         port = uri.getPort();
         token = uri.getRawFragment();
+    }
+
+    String fingerprint() { return DiscoveryIdentity.fingerprint(token); }
+    String credential() { return token; }
+
+    synchronized void relocate(LanPeer next, String identity) {
+        if (!token.equals(next.token)) throw new IllegalArgumentException("Different pairing");
+        endpoint = next;
+        address = next.address;
+        authority = next.authority;
+        node = identity;
+    }
+
+    String connectionLabel() {
+        return lastStatus == 401 ? "配对码已失效" : lastStatus == 0 ? "离线 · 等待重连"
+                : lastStatus > 0 ? "在线" : "尚未连接";
+    }
+
+    String authenticatedIdentity() {
+        try {
+            String nonce = java.util.UUID.randomUUID().toString().replace("-", "");
+            // Never reveal the bearer token to an endpoint supplied by unauthenticated NSD.
+            Reply reply = request("GET", "/api/discovery/" + nonce, 1100, false);
+            if (reply.status == 200) {
+                org.json.JSONObject data = new org.json.JSONObject(new String(reply.body, StandardCharsets.UTF_8));
+                String identity = data.optString("node");
+                String expected = DiscoveryIdentity.proof(token, nonce, identity, authority);
+                if (java.security.MessageDigest.isEqual(expected.getBytes(StandardCharsets.US_ASCII),
+                        data.optString("proof").getBytes(StandardCharsets.US_ASCII))) return identity;
+            }
+        } catch (IOException | org.json.JSONException ignored) { }
+        return "";
     }
 
     static LanPeer parse(String address) throws IOException {
@@ -138,14 +173,26 @@ final class LanPeer implements LanServer.Player {
     }
 
     private Reply request(String method, String path, int timeout) throws IOException {
+        return request(method, path, timeout, true);
+    }
+
+    private Reply request(String method, String path, int timeout, boolean authenticated) throws IOException {
+        LanPeer destination = endpoint;
+        if (destination == null) destination = this;
         try (Socket socket = new Socket()) {
-            socket.connect(new InetSocketAddress(host, port), 1000);
+            socket.connect(new InetSocketAddress(destination.host, destination.port), 1000);
             socket.setSoTimeout(timeout);
             String request = method + " " + path + " HTTP/1.1\r\n"
-                    + "Host: " + authority + "\r\nAuthorization: Bearer " + token + "\r\n"
+                    + "Host: " + destination.authority + "\r\n"
+                    + (authenticated ? "Authorization: Bearer " + token + "\r\n" : "")
                     + "Connection: close\r\nContent-Length: 0\r\n\r\n";
             socket.getOutputStream().write(request.getBytes(StandardCharsets.US_ASCII));
-            return readReply(new BufferedInputStream(socket.getInputStream()), timeout);
+            Reply reply = readReply(new BufferedInputStream(socket.getInputStream()), timeout);
+            lastStatus = reply.status;
+            return reply;
+        } catch (IOException error) {
+            lastStatus = 0;
+            throw error;
         }
     }
 

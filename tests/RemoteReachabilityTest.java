@@ -9,12 +9,12 @@ public final class RemoteReachabilityTest {
         JSONObject unreachableRelay = new JSONObject().put("ready", false).put("outputUnavailable", true);
 
         check(!poll(link, null, 0), "the first missed poll should allow for recovery");
-        check(!poll(link, null, 2499), "a short outage should preserve the remote session");
-        check(!poll(link, noTrack, 2500), "an online peer without a track should reset the deadline");
-        check(!poll(link, null, 3500), "a second outage gets a fresh grace period");
-        check(!poll(link, unreachableRelay, 5999), "a relay failure within the grace period");
-        check(poll(link, unreachableRelay, 6000), "sustained output loss should restore the local player");
-        check(!poll(link, noTrack, 6500), "an online peer still counts as reachable when idle");
+        check(!poll(link, null, 11999), "a short outage should preserve the remote session");
+        check(!poll(link, noTrack, 12000), "an online peer without a track should reset the deadline");
+        check(!poll(link, null, 13000), "a second outage gets a fresh grace period");
+        check(!poll(link, unreachableRelay, 24999), "a relay failure within the grace period");
+        check(poll(link, unreachableRelay, 25000), "sustained output loss should restore the local player");
+        check(!poll(link, noTrack, 26000), "an online peer still counts as reachable when idle");
 
         Peer playing = new Peer(204, playing(true), playing(true), playing(false));
         check(PairedPlayback.pauseAndConfirm(playing), "wait for the playing peer to actually pause");
