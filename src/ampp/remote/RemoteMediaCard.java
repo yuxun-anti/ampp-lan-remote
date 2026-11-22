@@ -108,9 +108,8 @@ final class RemoteMediaCard implements AutoCloseable {
             }
             receiverInstalled = true;
 
-            // The only clients with a reference should be the notification surface
-            // and its action buttons. Do not publish this as an active session.
-            session.setActive(false);
+            // Publish only after metadata and playback state are available. A
+            // fixed remote route leaves volume control with the output device.
             session.setPlaybackToRemote(new VolumeProvider(VolumeProvider.VOLUME_CONTROL_FIXED, 1, 0) {});
             session.setSessionActivity(openApp);
             session.setCallback(new MediaSession.Callback() {
@@ -190,6 +189,9 @@ final class RemoteMediaCard implements AutoCloseable {
             attempted = true;
             notificationPending = false;
         }
+        // Paused sessions remain available for resuming from a companion device.
+        boolean available = data != null;
+        if (session.isActive() != available) session.setActive(available);
     }
 
     private static String mediaId(JSONObject data) {

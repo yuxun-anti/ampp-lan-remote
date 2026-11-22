@@ -4,9 +4,9 @@
   "id": "ampp.remote.lan",
   "name": "局域网遥控",
   "author": "Codex",
-  "versionName": "0.8.3",
-  "versionCode": 32,
+  "versionName": "0.8.4",
+  "versionCode": 33,
   "entryClass": "ampp.remote.RemotePlugin",
   "minAndroidApi": 26,
-  "description": "从原生播放队列识别专辑，交接后显示是否接续了专辑队列。"
+  "description": "控制端发布原生媒体会话，供手表等设备识别远端播放。"
 }
